@@ -112,10 +112,10 @@ def get_frame(trace):
         color=(0, 255, 0))
     letter = 'H'
     if 'active' in trace and player_idx in trace['active']:
-      letter = 'X'
+      letter = str(player_idx)
     elif 'left_agent_controlled_player' in trace and player_idx in trace[
         'left_agent_controlled_player']:
-      letter = 'X'
+      letter = str(player_idx)
     writer.write(letter)
   for player_idx, player_coord in enumerate(trace['right_team']):
     writer = TextWriter(
@@ -126,10 +126,10 @@ def get_frame(trace):
         color=(255, 255, 0))
     letter = 'A'
     if 'opponent_active' in trace and player_idx in trace['opponent_active']:
-      letter = 'Y'
+      letter = str(player_idx)
     elif 'right_agent_controlled_player' in trace and player_idx in trace[
         'right_agent_controlled_player']:
-      letter = 'Y'
+      letter = str(player_idx)
     writer.write(letter)
   return frame
 
@@ -177,23 +177,49 @@ def write_dump(name, trace, config):
         writer = TextWriter(frame, 0)
         writer.write('FRAME: %d' % frame_cnt)
         writer.write('TIME: %f' % (o._time - time))
+        writer.write('TEAM | PLAYER | SPRINT | DRIBBLE | DIRECTION | ACTION',
+                     scale_factor=0.7)
         sticky_actions = football_action_set.get_sticky_actions(config)
-        sticky_actions_field = 'left_agent_sticky_actions'
-        if len(o[sticky_actions_field]) == 0:
-          sticky_actions_field = 'right_agent_sticky_actions'
-        assert len(sticky_actions) == len(o[sticky_actions_field][0])
-        active_direction = None
-        for i in range(len(sticky_actions)):
-          if sticky_actions[i]._directional:
-            if o[sticky_actions_field][0][i]:
-              active_direction = sticky_actions[i]
-          else:
-            writer.write('%s: %d' % (sticky_actions[i]._name,
-                                     o[sticky_actions_field][0][i]))
-        writer.write('DIRECTION: %s' % ('NONE' if active_direction is None
-                                        else active_direction._name))
-        if 'action' in o._trace['debug']:
-          writer.write('ACTION: %s' % (o['action'][0]._name))
+
+        for team in ['left', 'right']:
+          sticky_actions_field = '%s_agent_sticky_actions' % team
+          players_actions = {}
+          for player in range(len(o[sticky_actions_field])):
+            assert len(sticky_actions) == len(o[sticky_actions_field][player])
+            player_idx = o['%s_agent_controlled_player' % team][player]
+            players_actions[player_idx] = " "
+            players_actions[player_idx] += 'L' if team == 'left' else 'R'
+            players_actions[player_idx] += " | "
+            players_actions[player_idx] += str(player_idx)
+            active_direction = None
+            for i in range(len(sticky_actions)):
+              if sticky_actions[i]._directional:
+                if o[sticky_actions_field][player][i]:
+                  active_direction = sticky_actions[i]
+              else:
+                players_actions[player_idx] += \
+                  ' | %d' % (o[sticky_actions_field][player][i])
+
+            direction_short_name = {'top': 'TT',
+                                    'top_right': 'TR',
+                                    'right': 'RR',
+                                    'bottom_right': 'BR',
+                                    'bottom': 'BB',
+                                    'bottom_left': 'BL',
+                                    'left': 'LL',
+                                    'top_left': 'TL'}
+            # Info about direction
+            players_actions[player_idx] += ' | %s' % ('-' if active_direction
+                is None else direction_short_name[active_direction._name])
+            if 'action' in o._trace['debug']:
+              # Info about action
+              players_actions[player_idx] += \
+                ' | %s' % (o['action'][player]._name)
+
+          # Print the players from the team sorted
+          for _, player_actions in sorted(players_actions.items()):
+            writer.write(player_actions, scale_factor=0.7)
+
         if 'baseline' in o._trace['debug']:
           writer.write('BASELINE: %.5f' % o._trace['debug']['baseline'])
         if 'logits' in o._trace['debug']:
