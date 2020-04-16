@@ -145,7 +145,7 @@ def get_frame(trace):
         color=(0, 255, 0))
     letter = 'H'
     if 'active' in trace and player_idx in trace['active']:
-      letter = 'X' if single_player else str(player_idx)
+      letter = 'X'
     elif 'left_agent_controlled_player' in trace and player_idx in trace[
         'left_agent_controlled_player']:
       letter = 'X' if single_player else str(player_idx)
@@ -159,7 +159,7 @@ def get_frame(trace):
         color=(255, 255, 0))
     letter = 'A'
     if 'opponent_active' in trace and player_idx in trace['opponent_active']:
-      letter = 'Y' if single_player else str(player_idx)
+      letter = 'Y'
     elif 'right_agent_controlled_player' in trace and player_idx in trace[
         'right_agent_controlled_player']:
       letter = 'Y' if single_player else str(player_idx)
@@ -198,7 +198,6 @@ def pprint_players_actions(writer, players_actions):
                  direction_short_name[player_actions.get("DIRECTION", "-")],
                  player_actions.get("ACTION", "-")])
     writer.write_table(table_text, widths, scale_factor=0.6)
-
 
 def write_dump(name, trace, config):
   if len(trace) == 0:
@@ -239,8 +238,6 @@ def write_dump(name, trace, config):
         writer = TextWriter(frame, 0)
         writer.write('FRAME: %d' % frame_cnt)
         writer.write('TIME: %f' % (o._time - time))
-        writer.write('TEAM | PLAYER | SPRINT | DRIBBLE | DIRECTION | ACTION',
-                     scale_factor=0.7)
         sticky_actions = football_action_set.get_sticky_actions(config)
 
         players_actions = {}
