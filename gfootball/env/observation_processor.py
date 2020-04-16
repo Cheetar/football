@@ -145,7 +145,7 @@ def get_frame(trace):
         color=(0, 255, 0))
     letter = 'H'
     if 'active' in trace and player_idx in trace['active']:
-      letter = str(player_idx)
+      letter = 'X' if single_player else str(player_idx)
     elif 'left_agent_controlled_player' in trace and player_idx in trace[
         'left_agent_controlled_player']:
       letter = 'X' if single_player else str(player_idx)
@@ -159,7 +159,7 @@ def get_frame(trace):
         color=(255, 255, 0))
     letter = 'A'
     if 'opponent_active' in trace and player_idx in trace['opponent_active']:
-      letter = str(player_idx)
+      letter = 'Y' if single_player else str(player_idx)
     elif 'right_agent_controlled_player' in trace and player_idx in trace[
         'right_agent_controlled_player']:
       letter = 'Y' if single_player else str(player_idx)
