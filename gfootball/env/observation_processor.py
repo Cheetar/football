@@ -24,20 +24,18 @@ import datetime
 from absl import logging
 import os
 import shutil
+import string
 import tempfile
 import timeit
 import traceback
 
 from gfootball.env import config as cfg
-from gfootball.env import constants as const
+from gfootball.env import constants
 from gfootball.env import football_action_set
 import numpy as np
 from six.moves import range
 from six.moves import zip
 import six.moves.cPickle
-
-# How many past frames are kept around for the dumps to make use of them.
-PAST_STEPS_TRACE_SIZE = 100
 
 WRITE_FILES = True
 
@@ -50,15 +48,17 @@ except ImportError:
 class DumpConfig(object):
 
   def __init__(self,
+               max_length=200,
                max_count=1,
-               steps_before=PAST_STEPS_TRACE_SIZE,
-               steps_after=0,
+               snapshot_delay=0,
                min_frequency=10):
-    self._steps_before = steps_before
-    self._steps_after = steps_after
+    self._max_length = max_length
     self._max_count = max_count
-    self._last_dump_time = 0
-    self._active_dump = None
+    self._last_dump = 0
+    self._snapshot_delay = snapshot_delay
+    self._file_name = None
+    self._result = None
+    self._trigger_step = 0
     self._min_frequency = min_frequency
 
 
@@ -72,16 +72,62 @@ class TextWriter(object):
     self._pos_x = int(x)
     self._pos_y = int(y) + 20
     self._color = color
+    self._font = cv2.FONT_HERSHEY_SIMPLEX
+    self._lineType = 1
+    self._arrow_types = ('top', 'top_right', 'right', 'bottom_right', 'bottom',
+                         'bottom_left', 'left', 'top_left')
 
   def write(self, text, scale_factor=1):
-    font = cv2.FONT_HERSHEY_SIMPLEX
     textPos = (self._pos_x, self._pos_y)
     fontScale = 0.5 * scale_factor
-    lineType = 1
-    cv2.putText(self._frame, text, textPos, font, fontScale, self._color,
-                lineType)
+    cv2.putText(self._frame, text, textPos, self._font, fontScale, self._color,
+                self._lineType)
     self._pos_y += int(20 * scale_factor)
 
+  def write_table(self, data, widths, scale_factor=1, offset=0):
+    # data is a list of rows. Each row is a list of strings.
+    fontScale = 0.5 * scale_factor
+    init_x = self._pos_x
+    for row in data:
+      assert(len(row) == len(widths))
+      self._pos_x += offset
+      for col, cell in enumerate(row):
+        color = self._color
+        if isinstance(cell, tuple):
+            assert(len(cell) == 2)
+            (text, color) = cell
+        else:
+            assert(isinstance(cell, str))
+            text = cell
+
+        if text in self._arrow_types:
+          self.write_arrow(text, scale_factor=scale_factor)
+        else:
+          textPos = (self._pos_x, self._pos_y)
+          cv2.putText(self._frame, text, textPos, self._font, fontScale,
+                      color, self._lineType)
+        self._pos_x += widths[col]
+      self._pos_x = init_x
+      self._pos_y += int(20 * scale_factor)
+    self._pos_x = init_x
+
+  def write_arrow(self, arrow_type, scale_factor=1):
+    assert(arrow_type in self._arrow_types)
+    thickness = 1
+    arrow_offsets = {'top': (12, 0, 12, -16),
+                     'top_right': (16, -4, 4, -16),
+                     'right': (0, -10, 20, -10),
+                     'bottom_right': (4, -16, 16, -4),
+                     'bottom': (10, -16, 10, 0),
+                     'bottom_left': (12, -12, 0, 0),
+                     'left': (20, -10, 0, -10),
+                     'top_left': (16, -4, 4, -16)}
+    (s_x, s_y, e_x, e_y) =  tuple(int(v * scale_factor)
+                                  for v in arrow_offsets[arrow_type])
+    start_point = (self._pos_x + s_x, self._pos_y + s_y)
+    end_point = (self._pos_x + e_x, self._pos_y + e_y)
+    image = cv2.arrowedLine(self._frame, start_point, end_point,
+                            self._color, thickness)
 
 def get_frame(trace):
   if 'frame' in trace._trace['observation']:
@@ -112,11 +158,11 @@ def get_frame(trace):
         field_coords=True,
         color=(0, 255, 0))
     letter = 'H'
-    if 'active' in trace and player_idx in trace['active']:
+    if 'active' in trace and idx in trace['active']:
       letter = 'X'
     elif 'left_agent_controlled_player' in trace and player_idx in trace[
         'left_agent_controlled_player']:
-      letter = 'X'
+      letter = str(player_idx)
     writer.write(letter)
   for player_idx, player_coord in enumerate(trace['right_team']):
     writer = TextWriter(
@@ -126,11 +172,11 @@ def get_frame(trace):
         field_coords=True,
         color=(255, 255, 0))
     letter = 'A'
-    if 'opponent_active' in trace and player_idx in trace['opponent_active']:
+    if 'opponent_active' in trace and idx in trace['opponent_active']:
       letter = 'Y'
     elif 'right_agent_controlled_player' in trace and player_idx in trace[
         'right_agent_controlled_player']:
-      letter = 'Y'
+      letter = str(player_idx)
     writer.write(letter)
   return frame
 
@@ -139,132 +185,131 @@ def softmax(x):
   return np.exp(x) / np.sum(np.exp(x), axis=0)
 
 
-class ActiveDump(object):
+def write_players_state(writer, players_info):
+    table_text = [["PLAYER", "SPRINT", "DRIBBLE", "DIRECTION", "ACTION"]]
+    widths = [50, 50, 55, 60, 50]
 
-  def __init__(self,
-               name,
-               finish_step,
-               config):
-    self._name = name
-    self._finish_step = finish_step
-    self._config = config
-    self._video_fd = None
-    self._video_tmp = None
-    self._video_writer = None
-    self._frame_dim = None
-    self._step_cnt = 0
-    self._last_frame_time = 0
-    self._dump_file = None
-    if config['write_video']:
-      self._video_fd, self._video_tmp = tempfile.mkstemp(suffix='.avi')
-      if config['video_quality_level'] == 2:
-        self._frame_dim = (1280, 720)
-        fcc = cv2.VideoWriter_fourcc('p', 'n', 'g', ' ')
-      elif config['video_quality_level'] == 1:
-        fcc = cv2.VideoWriter_fourcc(*'MJPG')
-        self._frame_dim = (1280, 720)
-      else:
-        fcc = cv2.VideoWriter_fourcc(*'XVID')
-        self._frame_dim = (800, 450)
-      self._video_writer = cv2.VideoWriter(
-          self._video_tmp, fcc,
-          const.PHYSICS_STEPS_PER_SECOND / config['physics_steps_per_frame'],
-          self._frame_dim)
-    if WRITE_FILES:
-      self._dump_file = open(name + '.dump', 'wb')
+    # Sort the players according to the order they appear in observations
+    for _, player_info in sorted(players_info.items()):
+      color = (0, 255, 0) if player_info['team'] == 'left' else (0, 255, 255)
+      table_text.append([
+        (str(player_info.get("player_idx", "-")), color),
+        str(player_info.get("sprint", "-")),
+        str(player_info.get("dribble", "-")),
+        player_info.get("DIRECTION", "O"),
+        player_info.get("ACTION", "-")])
+    writer.write_table(table_text, widths, scale_factor=0.7, offset=10)
 
-  def __del__(self):
-    self.finalize()
-
-  def add_frame(self, frame):
-    if self._video_writer:
-      frame = frame[..., ::-1]
-      frame = cv2.resize(frame, self._frame_dim, interpolation=cv2.INTER_AREA)
-      self._video_writer.write(frame)
-
-  def add_step(self, o):
-    # Write video if requested.
-    if self._video_writer:
+def write_dump(name, trace, config):
+  if len(trace) == 0:
+    logging.warning('No data to write to the dump.')
+    return False
+  if config['write_video']:
+    fd, temp_path = tempfile.mkstemp(suffix='.avi')
+    if config['video_quality_level'] == 2:
+      frame_dim = (1280, 720)
+      fcc = cv2.VideoWriter_fourcc('p', 'n', 'g', ' ')
+    elif config['video_quality_level'] == 1:
+      fcc = cv2.VideoWriter_fourcc(*'MJPG')
+      frame_dim = (1280, 720)
+    else:
+      fcc = cv2.VideoWriter_fourcc(*'XVID')
+      frame_dim = (800, 450)
+    video = cv2.VideoWriter(
+        temp_path, fcc,
+        constants.PHYSICS_STEPS_PER_SECOND / config['physics_steps_per_frame'],
+        frame_dim)
+    frame_cnt = 0
+    time = trace[0]._time
+    for o in trace:
+      frame_cnt += 1
       frame = get_frame(o)
       frame = frame[..., ::-1]
-      frame = cv2.resize(frame, self._frame_dim, interpolation=cv2.INTER_AREA)
-      writer = TextWriter(frame, self._frame_dim[0] - 300)
-      if self._config['custom_display_stats']:
-        for line in self._config['custom_display_stats']:
+      frame = cv2.resize(frame, frame_dim, interpolation=cv2.INTER_AREA)
+      writer = TextWriter(frame, frame_dim[0] - 300)
+      if config['custom_display_stats']:
+        for line in config['custom_display_stats']:
           writer.write(line)
-      if self._config['display_game_stats']:
+      if config['display_game_stats']:
         writer.write('SCORE: %d - %d' % (o['score'][0], o['score'][1]))
         writer.write('BALL OWNED TEAM: %d' % (o['ball_owned_team']))
         writer.write('BALL OWNED PLAYER: %d' % (o['ball_owned_player']))
         writer.write('REWARD %.4f' % (o['reward']))
         writer.write('CUM. REWARD: %.4f' % (o['cumulative_reward']))
         writer = TextWriter(frame, 0)
-        writer.write('FRAME: %d' % self._step_cnt)
-        writer.write('TIME: %f' % (o._time - self._last_frame_time))
-        sticky_actions = football_action_set.get_sticky_actions(self._config)
-        sticky_actions_field = 'left_agent_sticky_actions'
-        if len(o[sticky_actions_field]) == 0:
-          sticky_actions_field = 'right_agent_sticky_actions'
-        assert len(sticky_actions) == len(o[sticky_actions_field][0])
-        active_direction = None
-        for i in range(len(sticky_actions)):
-          if sticky_actions[i]._directional:
-            if o[sticky_actions_field][0][i]:
-              active_direction = sticky_actions[i]
-          else:
-            writer.write('%s: %d' % (sticky_actions[i]._name,
-                                     o[sticky_actions_field][0][i]))
-        writer.write('DIRECTION: %s' % ('NONE' if active_direction is None
-                                        else active_direction._name))
-        if 'action' in o._trace['debug']:
-          writer.write('ACTION: %s' % (o['action'][0]._name))
+        writer.write('FRAME: %d' % frame_cnt)
+        writer.write('TIME: %f' % (o._time - time))
+        sticky_actions = football_action_set.get_sticky_actions(config)
+
+        players_info = {}
+        for team in ['left', 'right']:
+          sticky_actions_field = '%s_agent_sticky_actions' % team
+          for player in range(len(o[sticky_actions_field])):
+            assert len(sticky_actions) == len(o[sticky_actions_field][player])
+            player_idx = o['%s_agent_controlled_player' % team][player]
+            players_info[(team, player_idx)] = {'player_idx': player_idx,
+                                                'team': team}
+            active_direction = None
+            for i in range(len(sticky_actions)):
+              if sticky_actions[i]._directional:
+                if o[sticky_actions_field][player][i]:
+                  active_direction = sticky_actions[i]
+              else:
+                players_info[(team, player_idx)][sticky_actions[i]._name] = \
+                    o[sticky_actions_field][player][i]
+
+            # Info about direction
+            players_info[(team, player_idx)]['DIRECTION'] = \
+                'O' if active_direction is None else active_direction._name
+            if 'action' in o._trace['debug']:
+              # Info about action
+              players_info[(team, player_idx)]['ACTION'] = \
+                  o['action'][player]._name
+
+        write_players_state(writer, players_info)
+
         if 'baseline' in o._trace['debug']:
           writer.write('BASELINE: %.5f' % o._trace['debug']['baseline'])
         if 'logits' in o._trace['debug']:
           probs = softmax(o._trace['debug']['logits'])
-          action_set = football_action_set.get_action_set(self._config)
+          action_set = football_action_set.get_action_set(config)
           for action, prob in zip(action_set, probs):
             writer.write('%s: %.5f' % (action.name, prob), scale_factor=0.5)
         for d in o._debugs:
           writer.write(d)
-      self._video_writer.write(frame)
-    # Write the dump.
-    temp_frame = None
+      video.write(frame)
+      for frame in o._additional_frames:
+        frame = frame[..., ::-1]
+        frame = cv2.resize(frame, frame_dim, interpolation=cv2.INTER_AREA)
+        video.write(frame)
+    video.release()
+    os.close(fd)
+    try:
+      # For some reason sometimes the file is missing, so the code fails.
+      if WRITE_FILES:
+        shutil.copy2(temp_path, name + '.avi')
+      logging.info('Video written to %s.avi', name)
+      os.remove(temp_path)
+    except:
+      logging.error(traceback.format_exc())
+  to_pickle = []
+  temp_frames = []
+  for o in trace:
     if 'frame' in o._trace['observation']:
-      temp_frame = o._trace['observation']['frame']
+      temp_frames.append(o._trace['observation']['frame'])
       del o._trace['observation']['frame']
-
-    # Add config to the first frame for our replay tools to use.
-    if self._step_cnt == 0:
-      o['debug']['config'] = self._config.get_dictionary()
-
-    six.moves.cPickle.dump(o._trace, self._dump_file)
-    if temp_frame is not None:
-      o._trace['observation']['frame'] = temp_frame
-    self._last_frame_time = o._time
-    self._step_cnt += 1
-
-  def finalize(self):
-    if self._video_writer:
-      self._video_writer.release()
-      self._video_writer = None
-      os.close(self._video_fd)
-      try:
-        # For some reason sometimes the file is missing, so the code fails.
-        if WRITE_FILES:
-          shutil.copy2(self._video_tmp, self._name + '.avi')
-        logging.info('Video written to %s.avi', self._name)
-        os.remove(self._video_tmp)
-      except:
-        logging.error(traceback.format_exc())
-    if self._dump_file:
-      self._dump_file.close()
-      self._dump_file = None
-      if self._step_cnt == 0:
-        logging.warning('No data to write to the dump.')
-        return False
-      logging.info('Dump written to %s.dump', self._name)
-    return True
+    to_pickle.append(o._trace)
+  assert len(temp_frames) == 0 or len(temp_frames) == len(trace)
+  # Add config to the first frame for our replay tools to use.
+  to_pickle[0]['debug']['config'] = config.get_dictionary()
+  if WRITE_FILES:
+    with open(name + '.dump', 'wb') as f:
+      six.moves.cPickle.dump(to_pickle, f)
+  if len(temp_frames):
+    for o in trace:
+      o._trace['observation']['frame'] = temp_frames.pop(0)
+  logging.info('Dump written to %s.dump', name)
+  return True
 
 
 class ObservationState(object):
@@ -312,24 +357,23 @@ class ObservationProcessor(object):
     # Const. configuration
     self._ball_takeover_epsilon = 0.03
     self._ball_lost_epsilon = 0.05
+    self._trace_length = 10000 if config['dump_full_episodes'] else 200
     self._frame = 0
     self._dump_config = {}
     self._dump_config['score'] = DumpConfig(
-        steps_before=PAST_STEPS_TRACE_SIZE,
+        max_length=200,
         max_count=(100000 if config['dump_scores'] else 0),
         min_frequency=600,
-        steps_after=1)
+        snapshot_delay=10)
     self._dump_config['lost_score'] = DumpConfig(
-        steps_before=PAST_STEPS_TRACE_SIZE,
+        max_length=200,
         max_count=(100000 if config['dump_scores'] else 0),
         min_frequency=600,
-        steps_after=1)
+        snapshot_delay=10)
     self._dump_config['episode_done'] = DumpConfig(
-        steps_before=0,
-        # Record entire episode.
-        steps_after=10000,
+        max_length=10000,
         max_count=(100000 if config['dump_full_episodes'] else 0))
-    self._dump_config['shutdown'] = DumpConfig(steps_before=PAST_STEPS_TRACE_SIZE)
+    self._dump_config['shutdown'] = DumpConfig(max_length=10000)
     self._dump_directory = None
     self._config = config
     self.clear_state()
@@ -337,9 +381,13 @@ class ObservationProcessor(object):
   def clear_state(self):
     self._frame = 0
     self._state = None
-    self._trace = collections.deque([], PAST_STEPS_TRACE_SIZE)
+    self._trace = collections.deque([], self._trace_length)
+
+  def __del__(self):
+    self.process_pending_dumps(True)
 
   def reset(self):
+    self.process_pending_dumps(True)
     self.clear_state()
 
   def len(self):
@@ -351,25 +399,20 @@ class ObservationProcessor(object):
   def add_frame(self, frame):
     if len(self._trace) > 0 and self._config['write_video']:
       self._trace[-1].add_frame(frame)
-      for dump in self.pending_dumps():
-        dump.add_frame(frame)
 
   def update(self, trace):
     self._frame += 1
-    frame = trace.get('frame', None)
     if not self._config['write_video'] and 'frame' in trace['observation']:
-      # Don't record frame in the trace if we don't write video to save memory.
+      # Don't record frame in the trace if we don't write video - full episode
+      # consumes over 8G.
       no_video_trace = trace
       no_video_trace['observation'] = trace['observation'].copy()
       del no_video_trace['observation']['frame']
       self._state = ObservationState(no_video_trace)
-      frame = None
     else:
       self._state = ObservationState(trace)
     self._trace.append(self._state)
-    for dump in self.pending_dumps():
-      dump.add_step(self._state)
-    self.process_pending_dumps()
+    self.process_pending_dumps(False)
     return self._state
 
   def get_last_frame(self):
@@ -381,48 +424,41 @@ class ObservationProcessor(object):
     if not name in self._dump_config:
       self._dump_config[name] = DumpConfig()
     config = self._dump_config[name]
-    if config._active_dump:
+    if config._file_name:
       logging.debug('Dump "%s": already pending', name)
       return
     if config._max_count <= 0:
       logging.debug('Dump "%s": count limit reached / disabled', name)
       return
-    if config._last_dump_time >= timeit.default_timer() - config._min_frequency:
+    if config._last_dump >= timeit.default_timer() - config._min_frequency:
       logging.debug('Dump "%s": too frequent', name)
       return
     config._max_count -= 1
-    config._last_dump_time = timeit.default_timer()
+    config._last_dump = timeit.default_timer()
     if self._dump_directory is None:
       self._dump_directory = self._config['tracesdir']
       if WRITE_FILES:
         if not os.path.exists(self._dump_directory):
           os.makedirs(self._dump_directory)
-    dump_name = '{2}/{0}_{1}'.format(name,
+    config._file_name = '{2}/{0}_{1}'.format(
+        name,
         datetime.datetime.now().strftime('%Y%m%d-%H%M%S%f'),
         self._dump_directory)
-    config._active_dump = ActiveDump(dump_name,
-        self._frame + config._steps_after, self._config)
-    for step in list(self._trace)[-config._steps_before:]:
-      config._active_dump.add_step(step)
-      for frame in step._additional_frames:
-        config._active_dump.add_frame(frame)
-    if config._steps_after == 0:
-      # Synchronously finalize dump, so that crash dump is recorded.
-      config._active_dump.finalize()
-      config._active_dump = None
-    return dump_name
+    config._trigger_step = self._frame + config._snapshot_delay
+    self.process_pending_dumps(True)
+    return config._file_name
 
-  def pending_dumps(self):
-    dumps = []
-    for config in self._dump_config.values():
-      if config._active_dump:
-        dumps.append(config._active_dump)
-    return dumps
-
-  def process_pending_dumps(self):
+  def process_pending_dumps(self, finish):
     for name in self._dump_config:
       config = self._dump_config[name]
-      if config._active_dump and config._active_dump._finish_step <= self._frame:
-        config._active_dump.finalize()
-        config._active_dump = None
-
+      if config._file_name:
+        if finish or config._trigger_step <= self._frame:
+          logging.debug('Start dump %s', name)
+          trace = list(self._trace)[-config._max_length:]
+          write_dump(config._file_name, trace, self._config)
+          config._file_name = None
+      if config._result:
+        assert not config._file_name
+        if config._result.ready() or finish:
+          config._result.get()
+          config._result = None
